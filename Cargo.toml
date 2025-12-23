@@ -1,0 +1,43 @@
+[package]
+name = "vibecraft"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+zstd = { version = "0.13.3", default-features = false, features = [
+    "zstdmt",
+    "arrays",
+    "zdict_builder",
+    "experimental",
+] }
+
+[dependencies.bevy]
+git = "https://github.com/bevyengine/bevy"
+version = "0.18.0-dev"
+default-features = false
+features = [
+    "android-game-activity",
+    "android_shared_stdcxx",
+    "bevy_render",
+    "bevy_ui_render",
+    "bevy_asset",
+    "bevy_shader",
+    "bevy_pbr",
+    "bevy_log",
+    "bevy_mesh",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "multi_threaded",
+    "tonemapping_luts",
+    "wayland",
+    "default_font",
+    "zstd_c",
+]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.vibecraft]
+opt-level = 2
