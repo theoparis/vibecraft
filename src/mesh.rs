@@ -1,13 +1,17 @@
 use crate::{Block, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
 use bevy::asset::RenderAssetUsages;
+use bevy::math::Rect; // Added Rect import
 use bevy::mesh::Indices;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 
-pub fn generate_chunk_mesh(chunk: &Chunk) -> Mesh {
+pub fn generate_chunk_mesh(
+    chunk: &Chunk,
+    get_uv_rect: impl Fn(&Block, &Face) -> Option<Rect>,
+) -> Mesh {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
-    let mut colors = Vec::new();
+    let mut uvs = Vec::new(); // Changed from colors
     let mut indices = Vec::new();
 
     for x in 0..CHUNK_WIDTH {
@@ -18,100 +22,53 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> Mesh {
                     continue;
                 }
 
-                let base_color = match block {
-                    Block::Stone => [0.5, 0.5, 0.5, 1.0],
-                    Block::Dirt => [0.4, 0.2, 0.1, 1.0],
-                    Block::Grass => [0.1, 0.8, 0.1, 1.0],
-                    _ => [1.0, 1.0, 1.0, 1.0],
-                };
-
                 let fx = x as f32;
                 let fy = y as f32;
                 let fz = z as f32;
 
-                // Right (+X)
-                if x == CHUNK_WIDTH - 1 || chunk.get_block(x + 1, y, z) == Block::Air {
-                    add_face(
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                        fx,
-                        fy,
-                        fz,
+                let faces = [
+                    (
                         Face::Right,
-                        shade(base_color, 0.8),
-                    );
-                }
-                // Left (-X)
-                if x == 0 || chunk.get_block(x - 1, y, z) == Block::Air {
-                    add_face(
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                        fx,
-                        fy,
-                        fz,
+                        x == CHUNK_WIDTH - 1 || chunk.get_block(x + 1, y, z) == Block::Air,
+                    ),
+                    (
                         Face::Left,
-                        shade(base_color, 0.8),
-                    );
-                }
-                // Top (+Y)
-                if y == CHUNK_HEIGHT - 1 || chunk.get_block(x, y + 1, z) == Block::Air {
-                    add_face(
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                        fx,
-                        fy,
-                        fz,
+                        x == 0 || chunk.get_block(x - 1, y, z) == Block::Air,
+                    ),
+                    (
                         Face::Top,
-                        shade(base_color, 1.0),
-                    );
-                }
-                // Bottom (-Y)
-                if y == 0 || chunk.get_block(x, y - 1, z) == Block::Air {
-                    add_face(
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                        fx,
-                        fy,
-                        fz,
+                        y == CHUNK_HEIGHT - 1 || chunk.get_block(x, y + 1, z) == Block::Air,
+                    ),
+                    (
                         Face::Bottom,
-                        shade(base_color, 0.5),
-                    );
-                }
-                // Back (+Z)
-                if z == CHUNK_DEPTH - 1 || chunk.get_block(x, y, z + 1) == Block::Air {
-                    add_face(
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                        fx,
-                        fy,
-                        fz,
+                        y == 0 || chunk.get_block(x, y - 1, z) == Block::Air,
+                    ),
+                    (
                         Face::Back,
-                        shade(base_color, 0.9),
-                    );
-                }
-                // Forward (-Z)
-                if z == 0 || chunk.get_block(x, y, z - 1) == Block::Air {
-                    add_face(
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                        fx,
-                        fy,
-                        fz,
+                        z == CHUNK_DEPTH - 1 || chunk.get_block(x, y, z + 1) == Block::Air,
+                    ),
+                    (
                         Face::Forward,
-                        shade(base_color, 0.9),
-                    );
+                        z == 0 || chunk.get_block(x, y, z - 1) == Block::Air,
+                    ),
+                ];
+
+                for (face, visible) in faces {
+                    if visible {
+                        if let Some(rect) = get_uv_rect(&block, &face) {
+                            add_face(
+                                &mut positions,
+                                &mut normals,
+                                &mut uvs, // Changed from colors
+                                &mut indices,
+                                fx,
+                                fy,
+                                fz,
+                                face,
+                                rect, // Changed from color
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -123,18 +80,14 @@ pub fn generate_chunk_mesh(chunk: &Chunk) -> Mesh {
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs) // Changed from ATTRIBUTE_COLOR
     .with_inserted_indices(Indices::U32(indices))
 }
 
-fn shade(mut color: [f32; 4], factor: f32) -> [f32; 4] {
-    color[0] *= factor;
-    color[1] *= factor;
-    color[2] *= factor;
-    color
-}
+// Removed shade function
 
-enum Face {
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+pub enum Face {
     Top,
     Bottom,
     Left,
@@ -146,13 +99,13 @@ enum Face {
 fn add_face(
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
-    colors: &mut Vec<[f32; 4]>,
+    uvs: &mut Vec<[f32; 2]>, // Changed from colors
     indices: &mut Vec<u32>,
     x: f32,
     y: f32,
     z: f32,
     face: Face,
-    color: [f32; 4],
+    rect: Rect, // Changed from color
 ) {
     let start_idx = positions.len() as u32;
 
@@ -214,7 +167,29 @@ fn add_face(
         }
     }
 
-    colors.extend_from_slice(&[color; 4]);
+    // Map rect to UVs
+    // Assume vertices are ordered: 0, 1, 2, 3 corresponding to corners
+    // Standard quad order above seems to be:
+    // Top: (0,1), (0,1+1), (1,1+1), (1,1) -> Top-Left, Bottom-Left, Bottom-Right, Top-Right (in XZ plane)
+    // Wait, let's trace:
+    // Top: [x, y+1, z], [x, y+1, z+1], ...
+    // p0: (0,0) offset
+    // p1: (0,1) offset
+    // p2: (1,1) offset
+    // p3: (1,0) offset
+    // So UVs should follow similar 0,0 -> 0,1 -> 1,1 -> 1,0 pattern to match orientation.
+    // Rect.min is top-left in texture space? No, usually UV (0,0) is top-left in Bevy images.
+
+    let (u_min, v_min) = (rect.min.x, rect.min.y);
+    let (u_max, v_max) = (rect.max.x, rect.max.y);
+
+    uvs.extend_from_slice(&[
+        [u_min, v_min], // 0
+        [u_min, v_max], // 1
+        [u_max, v_max], // 2
+        [u_max, v_min], // 3
+    ]);
+
     indices.extend_from_slice(&[
         start_idx,
         start_idx + 1,

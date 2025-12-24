@@ -1,3 +1,5 @@
+cargo-features = ["codegen-backend"]
+
 [package]
 name = "vibecraft"
 version = "0.1.0"
@@ -11,6 +13,16 @@ zstd = { version = "0.13.3", default-features = false, features = [
     "zdict_builder",
     "experimental",
 ] }
+
+[build-dependencies]
+reqwest = { version = "0.13.0-rc.1", default-features = false, features = [
+    "blocking",
+    "json",
+] }
+zip = "7.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 
 [dependencies.bevy]
 git = "https://github.com/bevyengine/bevy"
@@ -34,10 +46,16 @@ features = [
     "wayland",
     "default_font",
     "zstd_c",
+    "bevy_state",
+    "bevy_sprite",
+    "png",
 ]
 
+[profile.dev]
+codegen-backend = "cranelift"
+
 [profile.dev.package."*"]
-opt-level = 3
+opt-level = 2
 
 [profile.dev.package.vibecraft]
-opt-level = 2
+opt-level = 1

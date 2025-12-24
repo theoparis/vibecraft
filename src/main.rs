@@ -13,8 +13,10 @@ use zstd::stream::{Decoder, Encoder};
 
 mod mesh;
 mod noise;
-use crate::mesh::generate_chunk_mesh;
+use crate::mesh::{Face, generate_chunk_mesh};
 use crate::noise::PerlinSimd;
+use bevy::asset::LoadedFolder;
+use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 
 /// A minecraft clone implemented in Rust with Bevy.
 /// Uses zstd for compression, and z-order for 16x256x16 chunk storage.
@@ -26,7 +28,7 @@ pub const CHUNK_VOLUME: usize = CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH;
 
 /// Represents a block type in the world.
 /// Using #[repr(u8)] for efficient storage and serialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[repr(u8)]
 pub enum Block {
     #[default]
@@ -34,6 +36,7 @@ pub enum Block {
     Stone = 1,
     Dirt = 2,
     Grass = 3,
+    // Add these for mapping if needed, though we just use basic IDs
 }
 
 impl From<u8> for Block {
@@ -49,6 +52,7 @@ impl From<u8> for Block {
 
 /// A 16x256x16 chunk of blocks.
 /// Uses z-order (Morton curve) indexing for spatial locality.
+#[derive(Clone)]
 pub struct Chunk {
     pub blocks: Box<[Block; CHUNK_VOLUME]>,
 }
@@ -200,6 +204,23 @@ impl ChunkMap {
 #[derive(Resource, Default)]
 struct LoadingChunks(HashSet<ChunkPos>);
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
+enum AppState {
+    #[default]
+    Loading,
+    InGame,
+}
+
+#[derive(Resource)]
+struct TextureLoading(Handle<LoadedFolder>);
+
+#[derive(Resource)]
+pub struct BlockTextureMap {
+    pub layout: Handle<TextureAtlasLayout>,
+    pub image: Handle<Image>,
+    pub map: HashMap<(Block, Face), usize>, // Map block+face to atlas index
+}
+
 // Async chunk generation
 
 #[derive(Component)]
@@ -332,20 +353,50 @@ fn update_chunks(
                 command_queue.push(move |world: &mut World| {
                     // Check if we still want this chunk (could be unloaded while generating)
                     // For simplicity, we just insert it.
-                    let mut chunk_map = world.resource_mut::<ChunkMap>();
-                    chunk_map.chunks.insert(chunk_pos, chunk);
 
-                    // Mesh generation
-                    let chunk_ref = chunk_map.chunks.get(&chunk_pos).unwrap();
-                    let mesh = generate_chunk_mesh(chunk_ref);
+                    // Get Texture Resources FIRST to avoid borrow conflicts
+                    let (texture_map_data, layout_handle) = {
+                        let texture_map = world.resource::<BlockTextureMap>();
+                        (texture_map.map.clone(), texture_map.layout.clone())
+                    };
+
+                    let layout: TextureAtlasLayout = {
+                        let layouts = world.resource::<Assets<TextureAtlasLayout>>();
+                        layouts.get(&layout_handle).unwrap().clone()
+                    };
+                    let atlas_size = layout.size.as_vec2();
+
+                    // Now get mutable access to ChunkMap
+                    let mut chunk_map_res = world.resource_mut::<ChunkMap>();
+                    chunk_map_res.chunks.insert(chunk_pos, chunk);
+
+                    // Re-acquire reference
+                    let chunk_ref = chunk_map_res.chunks.get(&chunk_pos).unwrap();
+
+                    // Generate mesh with UV closure
+                    let mesh = generate_chunk_mesh(chunk_ref, |block: &Block, face: &Face| {
+                        texture_map_data.get(&(*block, *face)).and_then(|&index| {
+                            layout.textures.get(index).map(|rect| {
+                                // Normalize Rect
+                                let min = rect.min.as_vec2() / atlas_size;
+                                let max = rect.max.as_vec2() / atlas_size;
+                                Rect { min, max }
+                            })
+                        })
+                    });
+
                     let mut meshes = world.resource_mut::<Assets<Mesh>>();
                     let mesh_handle = meshes.add(mesh);
 
+                    let texture_map = world.resource::<BlockTextureMap>();
+                    let image_handle = texture_map.image.clone();
+
                     let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
                     let material_handle = materials.add(StandardMaterial {
-                        base_color: Color::WHITE,
-                        perceptual_roughness: 0.95,
+                        base_color_texture: Some(image_handle),
+                        perceptual_roughness: 0.9,
                         reflectance: 0.1,
+                        unlit: false, // Use lighting
                         ..default()
                     });
 
@@ -414,6 +465,12 @@ fn setup(mut commands: Commands) {
         },
         Transform::from_xyz(50.0, 200.0, 50.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+}
+
+fn load_textures(mut commands: Commands, asset_server: Res<AssetServer>) {
+    // Load all textures in assets/textures/block
+    let handle = asset_server.load_folder("textures/block");
+    commands.insert_resource(TextureLoading(handle));
 }
 
 fn controller_input(
@@ -580,10 +637,126 @@ fn main() {
         }))
         .init_resource::<ChunkMap>()
         .init_resource::<LoadingChunks>()
-        .add_systems(Startup, setup)
+        .init_state::<AppState>()
+        .add_systems(Startup, load_textures)
+        .add_systems(Update, check_textures.run_if(in_state(AppState::Loading)))
+        .add_systems(OnEnter(AppState::InGame), setup)
         .add_systems(
             Update,
-            (handle_chunk_tasks, update_chunks, controller_input),
+            (handle_chunk_tasks, update_chunks, controller_input)
+                .run_if(in_state(AppState::InGame)),
         )
         .run();
+}
+
+fn check_textures(
+    mut commands: Commands,
+    loading: Res<TextureLoading>,
+    loaded_folders: Res<Assets<LoadedFolder>>,
+    mut texture_assets: ResMut<Assets<Image>>,
+    mut texture_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    if let Some(folder) = loaded_folders.get(&loading.0) {
+        let mut builder = TextureAtlasBuilder::default();
+        builder.padding(UVec2::splat(0));
+
+        // Check if all handles in folder are valid and loaded
+        let mut ready = true;
+        for handle in &folder.handles {
+            let handle = handle.clone().try_typed::<Image>().unwrap();
+            if !texture_assets.contains(&handle) {
+                ready = false;
+                break;
+            }
+        }
+        if !ready {
+            return;
+        }
+
+        let mut named_handles = HashMap::new();
+        for handle in &folder.handles {
+            let path = handle.path().unwrap();
+            let name = path.path().file_name().unwrap().to_str().unwrap();
+            let image_handle = handle.clone().try_typed::<Image>().unwrap();
+
+            // We can safely unwrap here because we checked contains above (mostly, unless race condition but single threaded mostly)
+            let texture = texture_assets.get(&image_handle).unwrap();
+            builder.add_texture(Some(image_handle.id()), texture);
+            named_handles.insert(name.to_string(), image_handle);
+        }
+
+        match builder.build() {
+            Ok((layout, sources, image)) => {
+                let mut final_image = image;
+                final_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                    mag_filter: ImageFilterMode::Nearest,
+                    min_filter: ImageFilterMode::Nearest,
+                    mipmap_filter: ImageFilterMode::Nearest,
+                    ..default()
+                });
+                let image = final_image;
+
+                let image_handle = texture_assets.add(image);
+                let layout_handle = texture_layouts.add(layout.clone());
+
+                let mut map = HashMap::new();
+
+                let faces_all = [
+                    Face::Top,
+                    Face::Bottom,
+                    Face::Left,
+                    Face::Right,
+                    Face::Back,
+                    Face::Forward,
+                ];
+                let faces_side = [Face::Left, Face::Right, Face::Back, Face::Forward];
+
+                // Stone
+                if let Some(h) = named_handles.get("stone.png") {
+                    if let Some(idx) = sources.texture_index(h.id()) {
+                        for f in faces_all {
+                            map.insert((Block::Stone, f), idx);
+                        }
+                    }
+                }
+
+                // Dirt
+                if let Some(h) = named_handles.get("dirt.png") {
+                    if let Some(idx) = sources.texture_index(h.id()) {
+                        for f in faces_all {
+                            map.insert((Block::Dirt, f), idx);
+                        }
+                        // Grass Bottom is Dirt
+                        map.insert((Block::Grass, Face::Bottom), idx);
+                    }
+                }
+
+                // Grass Top
+                if let Some(h) = named_handles.get("grass_block_top.png") {
+                    if let Some(idx) = sources.texture_index(h.id()) {
+                        map.insert((Block::Grass, Face::Top), idx);
+                    }
+                }
+
+                // Grass Side
+                if let Some(h) = named_handles.get("grass_block_side.png") {
+                    if let Some(idx) = sources.texture_index(h.id()) {
+                        for f in faces_side {
+                            map.insert((Block::Grass, f), idx);
+                        }
+                    }
+                }
+
+                commands.insert_resource(BlockTextureMap {
+                    layout: layout_handle,
+                    image: image_handle,
+                    map,
+                });
+
+                next_state.set(AppState::InGame);
+            }
+            Err(_) => return,
+        }
+    }
 }
