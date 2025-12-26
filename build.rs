@@ -1,49 +1,57 @@
+use rootcause::Report;
+use rootcause::prelude::ResultExt;
+use rootcause::report;
 use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn main() {
+fn main() -> Result<(), Report> {
+    let Ok(_) = rustls::crypto::ring::default_provider().install_default() else {
+        return Err(report!("Failed to install the rustls crypto provider"));
+    };
+
     println!("cargo:rerun-if-changed=build.rs");
 
-    let out_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("CARGO_MANIFEST_DIR")?;
     let assets_dir = Path::new(&out_dir).join("assets/textures/block");
 
     if assets_dir.exists() && fs::read_dir(&assets_dir).unwrap().count() > 10 {
-        return;
+        return Ok(());
     }
 
-    if let Err(e) = download_assets(&assets_dir) {
-        println!("cargo:warning=Failed to download minecraft assets: {}", e);
-        panic!("Failed to download minecraft assets: {}", e);
-    }
+    download_assets(&assets_dir).context("Failed to download minecraft assets")?;
+
+    Ok(())
 }
 
-fn download_assets(target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn download_assets(target_dir: &Path) -> Result<(), Report> {
     let client = reqwest::blocking::Client::new();
     let manifest_url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     let manifest: serde_json::Value = client.get(manifest_url).send()?.json()?;
 
     let latest_id = manifest["latest"]["release"]
         .as_str()
-        .ok_or("Could not find latest release version")?;
+        .ok_or(report!("Could not find latest release version"))?;
 
     let versions = manifest["versions"]
         .as_array()
-        .ok_or("Invalid versions array")?;
+        .ok_or(report!("Invalid versions array"))?;
 
     let version_info = versions
         .iter()
         .find(|v| v["id"].as_str() == Some(latest_id))
-        .ok_or("Could not find version info")?;
+        .ok_or(report!("Could not find version info"))?;
 
-    let url = version_info["url"].as_str().ok_or("Invalid version url")?;
+    let url = version_info["url"]
+        .as_str()
+        .ok_or(report!("Invalid version url"))?;
 
     let details: serde_json::Value = client.get(url).send()?.json()?;
 
     let client_jar_url = details["downloads"]["client"]["url"]
         .as_str()
-        .ok_or("Could not find client jar url")?;
+        .ok_or(report!("Could not find client jar url"))?;
 
     let mut jar_response = client.get(client_jar_url).send()?;
 

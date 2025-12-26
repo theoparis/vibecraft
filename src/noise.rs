@@ -20,10 +20,8 @@ impl PerlinSimd {
             permutation.swap(i, j);
         }
 
-        for i in 0..256 {
-            p[i] = permutation[i];
-            p[i + 256] = permutation[i];
-        }
+        p[..256].copy_from_slice(&permutation[..256]);
+        p[256..(256 + 256)].copy_from_slice(&permutation[..256]);
 
         Self { p }
     }

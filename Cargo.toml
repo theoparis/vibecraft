@@ -7,6 +7,10 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+rootcause = "0.11.0"
+# TODO: cranelift issue with graviola: https://github.com/ctz/graviola/issues/127
+# graviola = { git = "https://github.com/ctz/graviola", version = "0.3.0" }
+# rustls-graviola = { git = "https://github.com/ctz/graviola", version = "0.3.2" }
 zstd = { version = "0.13.3", default-features = false, features = [
     "zstdmt",
     "arrays",
@@ -18,11 +22,13 @@ zstd = { version = "0.13.3", default-features = false, features = [
 reqwest = { version = "0.13.0-rc.1", default-features = false, features = [
     "blocking",
     "json",
+    "rustls-no-provider",
 ] }
 zip = "7.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
+rustls = { version = "0.23.4", default-features = false, features = ["ring"] }
+rootcause = "0.11.0"
 
 [dependencies.bevy]
 git = "https://github.com/bevyengine/bevy"
@@ -53,6 +59,7 @@ features = [
 
 [profile.dev]
 codegen-backend = "cranelift"
+incremental = true
 
 [profile.dev.package."*"]
 opt-level = 2
