@@ -59,13 +59,21 @@ impl ChunkMeshData {
 // Grass tint color (Minecraft plains biome green, sRGB values)
 // The grass_block_top.png is grayscale and gets multiplied by this color
 const GRASS_TINT: [f32; 4] = [0.569, 0.741, 0.349, 1.0]; // #91BD59 in hex
-const WATER_TINT: [f32; 4] = [0.247, 0.463, 0.894, 0.7]; // Blue with transparency
 const NO_TINT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// Water surface height offset (Minecraft water is 14/16 = 0.875 of a block)
+const WATER_HEIGHT: f32 = 0.875;
+
+/// Result containing both solid and water meshes
+pub struct ChunkMeshes {
+    pub solid: ChunkMeshData,
+    pub water: ChunkMeshData,
+}
 
 pub fn generate_chunk_mesh_data(
     chunk: &Chunk,
     get_uv_rect: impl Fn(&Block, &Face) -> Option<Rect>,
-) -> ChunkMeshData {
+) -> ChunkMeshes {
     // Pre-allocate with reasonable capacity (average chunk has ~10k visible faces)
     let mut positions = Vec::with_capacity(40000);
     let mut normals = Vec::with_capacity(40000);
@@ -73,9 +81,16 @@ pub fn generate_chunk_mesh_data(
     let mut colors = Vec::with_capacity(40000);
     let mut indices = Vec::with_capacity(60000);
 
+    // Separate water mesh data
+    let mut water_positions = Vec::with_capacity(8000);
+    let mut water_normals = Vec::with_capacity(8000);
+    let mut water_uvs = Vec::with_capacity(8000);
+    let mut water_colors = Vec::with_capacity(8000);
+    let mut water_indices = Vec::with_capacity(12000);
+
     // First pass: find min/max Y for each column to avoid iterating all 256 levels
     let mut y_ranges = [[0u8; CHUNK_DEPTH]; CHUNK_WIDTH]; // max Y per column (0 = empty)
-    
+
     for x in 0..CHUNK_WIDTH {
         for z in 0..CHUNK_DEPTH {
             // Scan from top down to find highest non-air block
@@ -94,7 +109,7 @@ pub fn generate_chunk_mesh_data(
             if max_y == 0 {
                 continue; // Empty column
             }
-            
+
             for y in 0..max_y {
                 let block = chunk.get_block(x, y, z);
                 if block == Block::Air {
@@ -104,128 +119,154 @@ pub fn generate_chunk_mesh_data(
                 let fx = x as f32;
                 let fy = y as f32;
                 let fz = z as f32;
-                
-                let is_water = block == Block::Water;
 
-                let faces = [
-                    (
-                        Face::Right,
-                        x == CHUNK_WIDTH - 1 || {
-                            let neighbor = chunk.get_block(x + 1, y, z);
-                            if is_water {
-                                neighbor == Block::Air
-                            } else {
-                                neighbor.is_transparent()
-                            }
-                        },
-                    ),
-                    (
-                        Face::Left,
-                        x == 0 || {
-                            let neighbor = chunk.get_block(x - 1, y, z);
-                            if is_water {
-                                neighbor == Block::Air
-                            } else {
-                                neighbor.is_transparent()
-                            }
-                        },
-                    ),
-                    (
-                        Face::Top,
-                        y == CHUNK_HEIGHT - 1 || {
-                            let neighbor = chunk.get_block(x, y + 1, z);
-                            if is_water {
-                                neighbor == Block::Air
-                            } else {
-                                neighbor.is_transparent()
-                            }
-                        },
-                    ),
-                    (
-                        Face::Bottom,
-                        y == 0 || {
-                            let neighbor = chunk.get_block(x, y - 1, z);
-                            if is_water {
-                                neighbor == Block::Air
-                            } else {
-                                neighbor.is_transparent()
-                            }
-                        },
-                    ),
-                    (
-                        Face::Back,
-                        z == CHUNK_DEPTH - 1 || {
-                            let neighbor = chunk.get_block(x, y, z + 1);
-                            if is_water {
-                                neighbor == Block::Air
-                            } else {
-                                neighbor.is_transparent()
-                            }
-                        },
-                    ),
-                    (
-                        Face::Forward,
-                        z == 0 || {
-                            let neighbor = chunk.get_block(x, y, z - 1);
-                            if is_water {
-                                neighbor == Block::Air
-                            } else {
-                                neighbor.is_transparent()
-                            }
-                        },
-                    ),
-                ];
+                if block == Block::Water {
+                    // Generate water mesh separately
+                    // Only render water faces adjacent to air (not other water or solid blocks)
+                    // At chunk boundaries, don't render faces - they'll be handled by adjacent chunks
+                    let neighbor_right = if x == CHUNK_WIDTH - 1 {
+                        None
+                    } else {
+                        Some(chunk.get_block(x + 1, y, z))
+                    };
+                    let neighbor_left = if x == 0 {
+                        None
+                    } else {
+                        Some(chunk.get_block(x - 1, y, z))
+                    };
+                    let neighbor_top = if y == CHUNK_HEIGHT - 1 {
+                        Some(Block::Air)
+                    } else {
+                        Some(chunk.get_block(x, y + 1, z))
+                    };
+                    let neighbor_bottom = if y == 0 {
+                        None
+                    } else {
+                        Some(chunk.get_block(x, y - 1, z))
+                    };
+                    let neighbor_back = if z == CHUNK_DEPTH - 1 {
+                        None
+                    } else {
+                        Some(chunk.get_block(x, y, z + 1))
+                    };
+                    let neighbor_forward = if z == 0 {
+                        None
+                    } else {
+                        Some(chunk.get_block(x, y, z - 1))
+                    };
 
-                for (face, visible) in faces {
-                    if visible && let Some(rect) = get_uv_rect(&block, &face) {
-                        // Determine tint color based on block type and face
-                        let tint = if block == Block::Grass && face == Face::Top {
-                            GRASS_TINT
-                        } else if block == Block::Water {
-                            WATER_TINT
-                        } else {
-                            NO_TINT
-                        };
+                    let faces = [
+                        (Face::Right, neighbor_right == Some(Block::Air)),
+                        (Face::Left, neighbor_left == Some(Block::Air)),
+                        (Face::Top, neighbor_top == Some(Block::Air)),
+                        (Face::Bottom, neighbor_bottom == Some(Block::Air)),
+                        (Face::Back, neighbor_back == Some(Block::Air)),
+                        (Face::Forward, neighbor_forward == Some(Block::Air)),
+                    ];
 
-                        add_face(
-                            &mut positions,
-                            &mut normals,
-                            &mut uvs,
-                            &mut colors,
-                            &mut indices,
-                            fx,
-                            fy,
-                            fz,
-                            face,
-                            rect,
-                            tint,
-                        );
+                    for (face, visible) in faces {
+                        if visible && let Some(rect) = get_uv_rect(&block, &face) {
+                            add_water_face(
+                                &mut water_positions,
+                                &mut water_normals,
+                                &mut water_uvs,
+                                &mut water_colors,
+                                &mut water_indices,
+                                fx,
+                                fy,
+                                fz,
+                                face,
+                                rect,
+                            );
+                        }
+                    }
+                } else {
+                    // Solid block
+                    let faces = [
+                        (
+                            Face::Right,
+                            x == CHUNK_WIDTH - 1 || chunk.get_block(x + 1, y, z).is_transparent(),
+                        ),
+                        (
+                            Face::Left,
+                            x == 0 || chunk.get_block(x - 1, y, z).is_transparent(),
+                        ),
+                        (
+                            Face::Top,
+                            y == CHUNK_HEIGHT - 1 || chunk.get_block(x, y + 1, z).is_transparent(),
+                        ),
+                        (
+                            Face::Bottom,
+                            y == 0 || chunk.get_block(x, y - 1, z).is_transparent(),
+                        ),
+                        (
+                            Face::Back,
+                            z == CHUNK_DEPTH - 1 || chunk.get_block(x, y, z + 1).is_transparent(),
+                        ),
+                        (
+                            Face::Forward,
+                            z == 0 || chunk.get_block(x, y, z - 1).is_transparent(),
+                        ),
+                    ];
+
+                    for (face, visible) in faces {
+                        if visible && let Some(rect) = get_uv_rect(&block, &face) {
+                            let tint = if block == Block::Grass && face == Face::Top {
+                                GRASS_TINT
+                            } else {
+                                NO_TINT
+                            };
+
+                            add_face(
+                                &mut positions,
+                                &mut normals,
+                                &mut uvs,
+                                &mut colors,
+                                &mut indices,
+                                fx,
+                                fy,
+                                fz,
+                                face,
+                                rect,
+                                tint,
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    ChunkMeshData {
-        positions,
-        normals,
-        uvs,
-        colors,
-        indices,
+    ChunkMeshes {
+        solid: ChunkMeshData {
+            positions,
+            normals,
+            uvs,
+            colors,
+            indices,
+        },
+        water: ChunkMeshData {
+            positions: water_positions,
+            normals: water_normals,
+            uvs: water_uvs,
+            colors: water_colors,
+            indices: water_indices,
+        },
     }
 }
 
 /// Generate a lower-detail mesh by sampling blocks at intervals
+/// Note: For LOD, we only generate solid blocks - water is skipped at distance
 pub fn generate_chunk_mesh_data_lod(
     chunk: &Chunk,
     lod: LodLevel,
     get_uv_rect: impl Fn(&Block, &Face) -> Option<Rect>,
 ) -> ChunkMeshData {
     let block_size = lod.block_size();
-    
-    // For full detail, use the regular function
+
+    // For full detail, use the regular function and extract solid mesh
     if block_size == 1 {
-        return generate_chunk_mesh_data(chunk, get_uv_rect);
+        return generate_chunk_mesh_data(chunk, get_uv_rect).solid;
     }
 
     // Pre-allocate with smaller capacity for LOD (fewer faces)
@@ -237,7 +278,7 @@ pub fn generate_chunk_mesh_data_lod(
 
     let step = block_size;
     let fsize = block_size as f32;
-    
+
     // Find max Y to limit iteration
     let mut max_y = 0usize;
     for x in 0..CHUNK_WIDTH {
@@ -259,59 +300,64 @@ pub fn generate_chunk_mesh_data_lod(
             for z in (0..CHUNK_DEPTH).step_by(step) {
                 // Find the dominant non-air block in this group
                 let block = get_dominant_block(chunk, x, y, z, block_size);
-                if block == Block::Air {
+                // Skip air and water for LOD (water is only rendered at full detail)
+                if block == Block::Air || block == Block::Water {
                     continue;
                 }
 
                 let fx = x as f32;
                 let fy = y as f32;
                 let fz = z as f32;
-                
-                let is_water = block == Block::Water;
 
                 // Check neighbors for face visibility (at LOD scale)
                 let faces = [
                     (
                         Face::Right,
-                        x + step >= CHUNK_WIDTH || {
-                            let transparent = is_group_transparent(chunk, x + step, y, z, block_size);
-                            if is_water { is_group_air(chunk, x + step, y, z, block_size) } else { transparent }
-                        },
+                        x + step >= CHUNK_WIDTH
+                            || is_group_transparent(chunk, x + step, y, z, block_size),
                     ),
                     (
                         Face::Left,
-                        x == 0 || {
-                            let transparent = is_group_transparent(chunk, x.saturating_sub(step), y, z, block_size);
-                            if is_water { is_group_air(chunk, x.saturating_sub(step), y, z, block_size) } else { transparent }
-                        },
+                        x == 0
+                            || is_group_transparent(
+                                chunk,
+                                x.saturating_sub(step),
+                                y,
+                                z,
+                                block_size,
+                            ),
                     ),
                     (
                         Face::Top,
-                        y + step >= CHUNK_HEIGHT || {
-                            let transparent = is_group_transparent(chunk, x, y + step, z, block_size);
-                            if is_water { is_group_air(chunk, x, y + step, z, block_size) } else { transparent }
-                        },
+                        y + step >= CHUNK_HEIGHT
+                            || is_group_transparent(chunk, x, y + step, z, block_size),
                     ),
                     (
                         Face::Bottom,
-                        y == 0 || {
-                            let transparent = is_group_transparent(chunk, x, y.saturating_sub(step), z, block_size);
-                            if is_water { is_group_air(chunk, x, y.saturating_sub(step), z, block_size) } else { transparent }
-                        },
+                        y == 0
+                            || is_group_transparent(
+                                chunk,
+                                x,
+                                y.saturating_sub(step),
+                                z,
+                                block_size,
+                            ),
                     ),
                     (
                         Face::Back,
-                        z + step >= CHUNK_DEPTH || {
-                            let transparent = is_group_transparent(chunk, x, y, z + step, block_size);
-                            if is_water { is_group_air(chunk, x, y, z + step, block_size) } else { transparent }
-                        },
+                        z + step >= CHUNK_DEPTH
+                            || is_group_transparent(chunk, x, y, z + step, block_size),
                     ),
                     (
                         Face::Forward,
-                        z == 0 || {
-                            let transparent = is_group_transparent(chunk, x, y, z.saturating_sub(step), block_size);
-                            if is_water { is_group_air(chunk, x, y, z.saturating_sub(step), block_size) } else { transparent }
-                        },
+                        z == 0
+                            || is_group_transparent(
+                                chunk,
+                                x,
+                                y,
+                                z.saturating_sub(step),
+                                block_size,
+                            ),
                     ),
                 ];
 
@@ -319,8 +365,6 @@ pub fn generate_chunk_mesh_data_lod(
                     if visible && let Some(rect) = get_uv_rect(&block, &face) {
                         let tint = if block == Block::Grass && face == Face::Top {
                             GRASS_TINT
-                        } else if block == Block::Water {
-                            WATER_TINT
                         } else {
                             NO_TINT
                         };
@@ -355,9 +399,15 @@ pub fn generate_chunk_mesh_data_lod(
 }
 
 /// Get the dominant (most common non-air) block in a group
-fn get_dominant_block(chunk: &Chunk, start_x: usize, start_y: usize, start_z: usize, size: usize) -> Block {
+fn get_dominant_block(
+    chunk: &Chunk,
+    start_x: usize,
+    start_y: usize,
+    start_z: usize,
+    size: usize,
+) -> Block {
     let mut counts = [0u32; 6]; // Air, Stone, Dirt, Grass, Water, Sand
-    
+
     let end_x = (start_x + size).min(CHUNK_WIDTH);
     let end_y = (start_y + size).min(CHUNK_HEIGHT);
     let end_z = (start_z + size).min(CHUNK_DEPTH);
@@ -374,7 +424,7 @@ fn get_dominant_block(chunk: &Chunk, start_x: usize, start_y: usize, start_z: us
     // Find most common non-air block
     let mut best_block = Block::Air;
     let mut best_count = 0;
-    
+
     for (i, &count) in counts.iter().enumerate().skip(1) {
         if count > best_count {
             best_count = count;
@@ -392,7 +442,13 @@ fn get_dominant_block(chunk: &Chunk, start_x: usize, start_y: usize, start_z: us
 }
 
 /// Check if a block group is mostly transparent (air or water)
-fn is_group_transparent(chunk: &Chunk, start_x: usize, start_y: usize, start_z: usize, size: usize) -> bool {
+fn is_group_transparent(
+    chunk: &Chunk,
+    start_x: usize,
+    start_y: usize,
+    start_z: usize,
+    size: usize,
+) -> bool {
     let end_x = (start_x + size).min(CHUNK_WIDTH);
     let end_y = (start_y + size).min(CHUNK_HEIGHT);
     let end_z = (start_z + size).min(CHUNK_DEPTH);
@@ -413,30 +469,6 @@ fn is_group_transparent(chunk: &Chunk, start_x: usize, start_y: usize, start_z: 
 
     // Consider transparent if more than 50% transparent
     transparent_count * 2 > total
-}
-
-/// Check if a block group is mostly air (for water rendering)
-fn is_group_air(chunk: &Chunk, start_x: usize, start_y: usize, start_z: usize, size: usize) -> bool {
-    let end_x = (start_x + size).min(CHUNK_WIDTH);
-    let end_y = (start_y + size).min(CHUNK_HEIGHT);
-    let end_z = (start_z + size).min(CHUNK_DEPTH);
-
-    let mut air_count = 0;
-    let mut total = 0;
-
-    for x in start_x..end_x {
-        for y in start_y..end_y {
-            for z in start_z..end_z {
-                if chunk.get_block(x, y, z) == Block::Air {
-                    air_count += 1;
-                }
-                total += 1;
-            }
-        }
-    }
-
-    // Consider air if more than 50% air
-    air_count * 2 > total
 }
 
 /// Add a scaled face for LOD meshes
@@ -700,6 +732,133 @@ fn add_face(
 
     // Add vertex colors (4 vertices per face)
     colors.extend_from_slice(&[tint; 4]);
+
+    indices.extend_from_slice(&[
+        start_idx,
+        start_idx + 1,
+        start_idx + 2,
+        start_idx,
+        start_idx + 2,
+        start_idx + 3,
+    ]);
+}
+
+/// Add a water face with lowered top surface (like Minecraft)
+fn add_water_face(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    x: f32,
+    y: f32,
+    z: f32,
+    face: Face,
+    rect: Rect,
+) {
+    let start_idx = positions.len() as u32;
+
+    let (u_min, v_min) = (rect.min.x, rect.min.y);
+    let (u_max, v_max) = (rect.max.x, rect.max.y);
+
+    // Water top is slightly lower than a full block
+    let water_top = y + WATER_HEIGHT;
+
+    match face {
+        Face::Top => {
+            positions.extend_from_slice(&[
+                [x, water_top, z],
+                [x, water_top, z + 1.0],
+                [x + 1.0, water_top, z + 1.0],
+                [x + 1.0, water_top, z],
+            ]);
+            normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_min],
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+            ]);
+        }
+        Face::Bottom => {
+            positions.extend_from_slice(&[
+                [x, y, z],
+                [x + 1.0, y, z],
+                [x + 1.0, y, z + 1.0],
+                [x, y, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[0.0, -1.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_min],
+                [u_max, v_min],
+                [u_max, v_max],
+                [u_min, v_max],
+            ]);
+        }
+        Face::Right => {
+            positions.extend_from_slice(&[
+                [x + 1.0, y, z + 1.0],
+                [x + 1.0, y, z],
+                [x + 1.0, water_top, z],
+                [x + 1.0, water_top, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[1.0, 0.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Left => {
+            positions.extend_from_slice(&[
+                [x, y, z],
+                [x, y, z + 1.0],
+                [x, water_top, z + 1.0],
+                [x, water_top, z],
+            ]);
+            normals.extend_from_slice(&[[-1.0, 0.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Back => {
+            positions.extend_from_slice(&[
+                [x, y, z + 1.0],
+                [x + 1.0, y, z + 1.0],
+                [x + 1.0, water_top, z + 1.0],
+                [x, water_top, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Forward => {
+            positions.extend_from_slice(&[
+                [x + 1.0, y, z],
+                [x, y, z],
+                [x, water_top, z],
+                [x + 1.0, water_top, z],
+            ]);
+            normals.extend_from_slice(&[[0.0, 0.0, -1.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+    }
+
+    // White color - tinting handled by material
+    colors.extend_from_slice(&[NO_TINT; 4]);
 
     indices.extend_from_slice(&[
         start_idx,

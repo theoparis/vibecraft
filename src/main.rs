@@ -1,17 +1,20 @@
 #![feature(portable_simd)]
 use bevy::input::mouse::MouseMotion;
+use bevy::pbr::DistanceFog;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions};
 use core::simd::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
 use std::io::{Read, Write};
+use std::sync::RwLock;
 use zstd::stream::{Decoder, Encoder};
 
 mod mesh;
 mod noise;
-use crate::mesh::{ChunkMeshData, Face, LodLevel, generate_chunk_mesh_data, generate_chunk_mesh_data_lod};
+use crate::mesh::{
+    ChunkMeshData, Face, LodLevel, generate_chunk_mesh_data, generate_chunk_mesh_data_lod,
+};
 use crate::noise::PerlinSimd;
 use bevy::asset::LoadedFolder;
 use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -54,7 +57,7 @@ impl Block {
     pub fn is_transparent(&self) -> bool {
         matches!(self, Block::Air | Block::Water)
     }
-    
+
     /// Returns true if this block is a liquid
     pub fn is_liquid(&self) -> bool {
         matches!(self, Block::Water)
@@ -164,10 +167,15 @@ pub struct FpsController {
     pub time_since_grounded: f32,
     /// Time since jump was pressed (for jump buffering)
     pub jump_buffer: f32,
+    /// Whether the player is currently in water
+    pub in_water: bool,
 }
 
 #[derive(Component)]
 pub struct ChunkEntity(pub ChunkPos);
+
+#[derive(Component)]
+pub struct WaterEntity(pub ChunkPos);
 
 /// A resource that stores all loaded chunks (compressed with zstd).
 /// Uses a cache for decompressed chunks to avoid repeated decompression.
@@ -235,7 +243,7 @@ impl ChunkMap {
         let local_z = z.rem_euclid(CHUNK_DEPTH as i32) as usize;
 
         let mut cache = self.cache.write().unwrap();
-        
+
         // If not in cache, decompress it
         if !cache.contains_key(&chunk_pos) {
             if let Some(compressed) = self.chunks.get(&chunk_pos) {
@@ -294,6 +302,10 @@ pub struct BlockTextureMap {
 #[derive(Resource)]
 pub struct SharedChunkMaterial(pub Handle<StandardMaterial>);
 
+/// Shared material for water (translucent)
+#[derive(Resource)]
+pub struct WaterMaterial(pub Handle<StandardMaterial>);
+
 /// Timer to throttle chunk loading/unloading checks (expensive operations)
 #[derive(Resource)]
 pub struct ChunkUpdateTimer {
@@ -309,11 +321,12 @@ pub struct ChunkUpdateTimer {
 pub struct ChunkGenResult {
     pub chunk: Chunk,
     pub compressed_chunk: Vec<u8>,
-    pub mesh_lod0: ChunkMeshData, // Full detail
-    pub mesh_lod1: ChunkMeshData, // Medium detail (2x2x2)
-    pub mesh_lod2: ChunkMeshData, // Low detail (4x4x4)
+    pub mesh_lod0: ChunkMeshData,  // Full detail (solid blocks)
+    pub mesh_lod1: ChunkMeshData,  // Medium detail (2x2x2)
+    pub mesh_lod2: ChunkMeshData,  // Low detail (4x4x4)
+    pub water_mesh: ChunkMeshData, // Water mesh (separate for transparency)
     pub chunk_pos: ChunkPos,
-    pub distance_sq: i32,         // Distance from player for prioritization
+    pub distance_sq: i32, // Distance from player for prioritization
 }
 
 /// Stores mesh handles for all LOD levels of a chunk
@@ -343,14 +356,14 @@ pub const SEA_LEVEL: usize = 62;
 
 fn generate_chunk(pos: ChunkPos, noise: &PerlinSimd) -> Chunk {
     let mut chunk = Chunk::new();
-    
+
     // Pre-compute cave data for the entire chunk using SIMD
     // We'll sample at every 2 blocks and interpolate conceptually (or just use nearest)
     // Process 8 Y values at a time for each (x, z) column
-    
+
     // First pass: compute heightmap for all columns
     let mut heightmap = [[0usize; CHUNK_DEPTH]; CHUNK_WIDTH];
-    
+
     for z in 0..CHUNK_DEPTH {
         let world_z = (pos.z * CHUNK_DEPTH as i32 + z as i32) as f32;
         let z_vec = f32x8::splat(world_z);
@@ -390,18 +403,18 @@ fn generate_chunk(pos: ChunkPos, noise: &PerlinSimd) -> Chunk {
             }
         }
     }
-    
+
     // Second pass: generate terrain with caves using SIMD for Y batches
     for z in 0..CHUNK_DEPTH {
         let world_z = (pos.z * CHUNK_DEPTH as i32 + z as i32) as f32;
-        
+
         for x in 0..CHUNK_WIDTH {
             let world_x = (pos.x * CHUNK_WIDTH as i32 + x as i32) as f32;
             let surface_height = heightmap[x][z];
-            
+
             // Process Y in batches of 8 for cave noise
             let max_y = surface_height.max(SEA_LEVEL);
-            
+
             for y_base in (0..=max_y).step_by(8) {
                 // Create Y vector for this batch
                 let y_vec = f32x8::from_array([
@@ -414,35 +427,35 @@ fn generate_chunk(pos: ChunkPos, noise: &PerlinSimd) -> Chunk {
                     (y_base + 6) as f32,
                     (y_base + 7) as f32,
                 ]);
-                
+
                 // Compute cave noise for 8 Y values at once
                 let cave_noise1 = noise.get_3d(
                     f32x8::splat(world_x * 0.05),
                     y_vec * f32x8::splat(0.05),
                     f32x8::splat(world_z * 0.05),
                 );
-                
+
                 let cave_noise2 = noise.get_3d(
                     f32x8::splat(world_x * 0.08 + 1000.0),
                     y_vec * f32x8::splat(0.08),
                     f32x8::splat(world_z * 0.08 + 1000.0),
                 );
-                
+
                 let cave1_arr = cave_noise1.to_array();
                 let cave2_arr = cave_noise2.to_array();
-                
+
                 // Process each Y in this batch
                 for i in 0..8 {
                     let y = y_base + i;
                     if y > max_y {
                         break;
                     }
-                    
-                    let is_cave = cave1_arr[i].abs() < 0.1 
-                        && cave2_arr[i].abs() < 0.1 
-                        && y > 5 
+
+                    let is_cave = cave1_arr[i].abs() < 0.1
+                        && cave2_arr[i].abs() < 0.1
+                        && y > 5
                         && y < surface_height.saturating_sub(2);
-                    
+
                     if y <= surface_height {
                         if is_cave {
                             // Cave - fill with water if below sea level
@@ -479,11 +492,53 @@ fn generate_chunk(pos: ChunkPos, noise: &PerlinSimd) -> Chunk {
     chunk
 }
 
+/// Update fog settings based on whether the player is underwater
+fn update_underwater_fog(
+    mut query: Query<(&FpsController, &Transform, &mut DistanceFog)>,
+    chunk_map: Res<ChunkMap>,
+) {
+    for (controller, transform, mut fog) in &mut query {
+        // Check if camera (eyes) are in water
+        let eye_pos = transform.translation;
+        let eye_y = eye_pos.y.floor() as i32;
+        let px = eye_pos.x.floor() as i32;
+        let pz = eye_pos.z.floor() as i32;
+
+        let eyes_in_water = chunk_map
+            .get_block(px, eye_y, pz)
+            .map_or(false, |b| b == Block::Water);
+
+        if eyes_in_water {
+            // Underwater fog - dense blue-green
+            fog.color = Color::srgba(0.1, 0.3, 0.5, 1.0);
+            fog.falloff = bevy::pbr::FogFalloff::Linear {
+                start: 1.0,
+                end: 30.0, // Very short visibility underwater
+            };
+        } else if controller.in_water {
+            // Partially submerged - lighter fog
+            fog.color = Color::srgba(0.3, 0.5, 0.7, 1.0);
+            fog.falloff = bevy::pbr::FogFalloff::Linear {
+                start: 50.0,
+                end: 200.0,
+            };
+        } else {
+            // Normal atmospheric fog
+            fog.color = Color::srgba(0.5, 0.7, 0.9, 1.0);
+            fog.falloff = bevy::pbr::FogFalloff::Linear {
+                start: 500.0,
+                end: 1000.0,
+            };
+        }
+    }
+}
+
 fn update_chunks(
     mut commands: Commands,
     mut chunk_map: ResMut<ChunkMap>,
     mut loading: ResMut<LoadingChunks>,
     mut chunk_entities: Query<(Entity, &ChunkEntity)>,
+    mut water_entities: Query<(Entity, &WaterEntity), Without<ChunkEntity>>,
     player_query: Query<&Transform, With<FpsController>>,
     texture_map: Res<BlockTextureMap>,
     layouts: Res<Assets<TextureAtlasLayout>>,
@@ -511,7 +566,7 @@ fn update_chunks(
     // Tick timer and check if we should run
     timer.load_timer.tick(time.delta());
     let should_run = timer.load_timer.just_finished() || player_moved_chunk;
-    
+
     if !should_run {
         return;
     }
@@ -535,6 +590,13 @@ fn update_chunks(
         if !required_chunks.contains(&chunk_entity.0) {
             commands.entity(entity).despawn();
             chunk_map.remove(&chunk_entity.0);
+        }
+    }
+
+    // Also despawn water entities for far chunks
+    for (entity, water_entity) in &mut water_entities {
+        if !required_chunks.contains(&water_entity.0) {
+            commands.entity(entity).despawn();
         }
     }
 
@@ -576,7 +638,7 @@ fn update_chunks(
             let chunk = generate_chunk(chunk_pos, &perlin);
 
             // Generate mesh data for LOD levels (reduced to 3 for performance)
-            let (mesh_lod0, mesh_lod1, mesh_lod2) = if let Some(layout) = layout {
+            let (mesh_lod0, mesh_lod1, mesh_lod2, water_mesh) = if let Some(layout) = layout {
                 let atlas_size = layout.size.as_vec2();
                 let get_uv = |block: &Block, face: &Face| {
                     texture_data.get(&(*block, *face)).and_then(|&index| {
@@ -587,11 +649,11 @@ fn update_chunks(
                         })
                     })
                 };
-                
-                let lod0 = generate_chunk_mesh_data(&chunk, &get_uv);
+
+                let meshes = generate_chunk_mesh_data(&chunk, &get_uv);
                 let lod1 = generate_chunk_mesh_data_lod(&chunk, LodLevel::Medium, &get_uv);
                 let lod2 = generate_chunk_mesh_data_lod(&chunk, LodLevel::Low, &get_uv);
-                (lod0, lod1, lod2)
+                (meshes.solid, lod1, lod2, meshes.water)
             } else {
                 // Fallback empty meshes if layout not ready
                 let empty = || ChunkMeshData {
@@ -601,13 +663,11 @@ fn update_chunks(
                     colors: Vec::new(),
                     indices: Vec::new(),
                 };
-                (empty(), empty(), empty())
+                (empty(), empty(), empty(), empty())
             };
 
             // Compress chunk data using zstd for efficient storage
-            let compressed_chunk = chunk
-                .compress()
-                .expect("Failed to compress chunk");
+            let compressed_chunk = chunk.compress().expect("Failed to compress chunk");
 
             ChunkGenResult {
                 chunk,
@@ -615,6 +675,7 @@ fn update_chunks(
                 mesh_lod0,
                 mesh_lod1,
                 mesh_lod2,
+                water_mesh,
                 chunk_pos,
                 distance_sq,
             }
@@ -632,6 +693,7 @@ fn handle_chunk_tasks(
     mut loading: ResMut<LoadingChunks>,
     mut meshes: ResMut<Assets<Mesh>>,
     shared_material: Option<Res<SharedChunkMaterial>>,
+    water_material: Option<Res<WaterMaterial>>,
 ) {
     // LOD distance thresholds (in chunk units squared)
     // More generous thresholds for Distant Horizons-like experience
@@ -639,6 +701,9 @@ fn handle_chunk_tasks(
     const LOD1_DIST_SQ: i32 = 32 * 32; // Medium detail: 12-32 chunks (512 blocks)
 
     let Some(material) = shared_material else {
+        return;
+    };
+    let Some(water_mat) = water_material else {
         return;
     };
 
@@ -678,15 +743,17 @@ fn handle_chunk_tasks(
                 (mesh_lod2.clone(), 2)
             };
 
-            // Spawn SINGLE entity per chunk with the appropriate LOD mesh
+            let chunk_transform = Transform::from_xyz(
+                chunk_pos.x as f32 * CHUNK_WIDTH as f32,
+                0.0,
+                chunk_pos.z as f32 * CHUNK_DEPTH as f32,
+            );
+
+            // Spawn solid mesh entity
             commands.spawn((
                 Mesh3d(initial_mesh),
                 MeshMaterial3d(material.0.clone()),
-                Transform::from_xyz(
-                    chunk_pos.x as f32 * CHUNK_WIDTH as f32,
-                    0.0,
-                    chunk_pos.z as f32 * CHUNK_DEPTH as f32,
-                ),
+                chunk_transform,
                 ChunkEntity(chunk_pos),
                 ChunkLodMeshes {
                     lod0: mesh_lod0,
@@ -695,6 +762,17 @@ fn handle_chunk_tasks(
                     current_lod,
                 },
             ));
+
+            // Spawn water mesh entity (only if there's water)
+            if !result.water_mesh.positions.is_empty() {
+                let water_mesh_handle = meshes.add(result.water_mesh.into_mesh());
+                commands.spawn((
+                    Mesh3d(water_mesh_handle),
+                    MeshMaterial3d(water_mat.0.clone()),
+                    chunk_transform,
+                    WaterEntity(chunk_pos),
+                ));
+            }
 
             // Remove from loading set and despawn task entity
             loading.0.remove(&chunk_pos);
@@ -785,6 +863,16 @@ fn setup(mut commands: Commands) {
             grounded: false,
             time_since_grounded: 0.0,
             jump_buffer: 0.0,
+            in_water: false,
+        },
+        // Fog component - updated dynamically based on whether underwater
+        DistanceFog {
+            color: Color::srgba(0.5, 0.7, 0.9, 1.0), // Sky blue for normal
+            falloff: bevy::pbr::FogFalloff::Linear {
+                start: 500.0,
+                end: 1000.0,
+            },
+            ..default()
         },
     ));
 
@@ -839,71 +927,111 @@ fn controller_input(
                 transform.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
             }
 
+            // --- Check if player is in water ---
+            // Check at eye level and feet level
+            let eye_pos = transform.translation;
+            let feet_y = (eye_pos.y - 1.6).floor() as i32;
+            let eye_y = eye_pos.y.floor() as i32;
+            let px = eye_pos.x.floor() as i32;
+            let pz = eye_pos.z.floor() as i32;
+
+            let feet_in_water = chunk_map
+                .get_block(px, feet_y, pz)
+                .map_or(false, |b| b == Block::Water);
+            let eyes_in_water = chunk_map
+                .get_block(px, eye_y, pz)
+                .map_or(false, |b| b == Block::Water);
+            controller.in_water = feet_in_water || eyes_in_water;
+
             // --- Movement Input ---
             let mut wish_dir = Vec3::ZERO;
             let forward = transform.forward();
             let right = transform.right();
-            // Flatten forward/right for ground movement
-            let flat_forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
-            let flat_right = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+
+            // In water, we can swim in the direction we're looking
+            // On land, we only move horizontally
+            let (move_forward, move_right) = if controller.in_water {
+                (forward.as_vec3(), right.as_vec3())
+            } else {
+                let flat_forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+                let flat_right = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+                (flat_forward, flat_right)
+            };
 
             if key.pressed(KeyCode::KeyW) {
-                wish_dir += flat_forward;
+                wish_dir += move_forward;
             }
             if key.pressed(KeyCode::KeyS) {
-                wish_dir -= flat_forward;
+                wish_dir -= move_forward;
             }
             if key.pressed(KeyCode::KeyD) {
-                wish_dir += flat_right;
+                wish_dir += move_right;
             }
             if key.pressed(KeyCode::KeyA) {
-                wish_dir -= flat_right;
+                wish_dir -= move_right;
             }
 
             if wish_dir.length_squared() > 0.0 {
                 wish_dir = wish_dir.normalize();
             }
 
-            // Sprint
-            let current_speed = if key.pressed(KeyCode::ControlLeft) {
+            // Sprint (not effective in water)
+            let current_speed = if controller.in_water {
+                controller.speed * 0.5 // Swimming is slower
+            } else if key.pressed(KeyCode::ControlLeft) {
                 controller.speed * 1.5
             } else {
                 controller.speed
             };
 
-            // Accelerate horizontally
+            // Accelerate
             let target_vel = wish_dir * current_speed;
-            let accel = 10.0; // Acceleration factor
+            let accel = if controller.in_water { 5.0 } else { 10.0 }; // Slower acceleration in water
 
-            // Move generic velocity towards target X/Z
+            // In water, we move in 3D; on land, only X/Z
             controller.velocity.x = controller.velocity.x.lerp(target_vel.x, accel * dt);
             controller.velocity.z = controller.velocity.z.lerp(target_vel.z, accel * dt);
 
-            // --- Gravity & Jumping ---
-            // Minecraft-like constants
-            const COYOTE_TIME: f32 = 0.1; // Can jump shortly after leaving ground
-            const JUMP_BUFFER: f32 = 0.15; // Buffer jump input before landing
-
-            // Update jump buffer
-            if key.just_pressed(KeyCode::Space) {
-                controller.jump_buffer = JUMP_BUFFER;
+            if controller.in_water {
+                // Swimming controls
+                if key.pressed(KeyCode::Space) {
+                    // Swim up
+                    controller.velocity.y = controller.velocity.y.lerp(current_speed, accel * dt);
+                } else if key.pressed(KeyCode::ShiftLeft) {
+                    // Swim down
+                    controller.velocity.y = controller.velocity.y.lerp(-current_speed, accel * dt);
+                } else {
+                    // Apply water drag and slight sink
+                    controller.velocity.y =
+                        controller.velocity.y.lerp(target_vel.y - 2.0, accel * dt);
+                }
             } else {
-                controller.jump_buffer = (controller.jump_buffer - dt).max(0.0);
-            }
+                // --- Gravity & Jumping (land) ---
+                // Minecraft-like constants
+                const COYOTE_TIME: f32 = 0.1; // Can jump shortly after leaving ground
+                const JUMP_BUFFER: f32 = 0.15; // Buffer jump input before landing
 
-            // Check if we can jump (grounded or within coyote time) and want to jump (buffered)
-            let can_jump = controller.grounded || controller.time_since_grounded < COYOTE_TIME;
-            if can_jump && controller.jump_buffer > 0.0 {
-                controller.velocity.y = controller.jump_force;
-                controller.grounded = false;
-                controller.time_since_grounded = COYOTE_TIME; // Prevent double jump
-                controller.jump_buffer = 0.0; // Consume the buffer
-            }
+                // Update jump buffer
+                if key.just_pressed(KeyCode::Space) {
+                    controller.jump_buffer = JUMP_BUFFER;
+                } else {
+                    controller.jump_buffer = (controller.jump_buffer - dt).max(0.0);
+                }
 
-            // Apply gravity when not grounded
-            if !controller.grounded {
-                controller.velocity.y -= controller.gravity * dt;
-                controller.time_since_grounded += dt;
+                // Check if we can jump (grounded or within coyote time) and want to jump (buffered)
+                let can_jump = controller.grounded || controller.time_since_grounded < COYOTE_TIME;
+                if can_jump && controller.jump_buffer > 0.0 {
+                    controller.velocity.y = controller.jump_force;
+                    controller.grounded = false;
+                    controller.time_since_grounded = COYOTE_TIME; // Prevent double jump
+                    controller.jump_buffer = 0.0; // Consume the buffer
+                }
+
+                // Apply gravity when not grounded
+                if !controller.grounded {
+                    controller.velocity.y -= controller.gravity * dt;
+                    controller.time_since_grounded += dt;
+                }
             }
 
             // --- simple Collision & Integration ---
@@ -927,7 +1055,8 @@ fn controller_input(
                     for z in min_z..=max_z {
                         for x in min_x..=max_x {
                             if let Some(block) = chunk_map.get_block(x, y, z) {
-                                if block != Block::Air {
+                                // Only solid blocks cause collision (not air or water)
+                                if !block.is_transparent() {
                                     return true; // Collision
                                 }
                             } else {
@@ -973,22 +1102,32 @@ fn controller_input(
                 controller.velocity.y = 0.0;
             } else {
                 transform.translation.y = test_pos.y;
-                // Only set grounded to false if we're actually moving up or 
+                // Only set grounded to false if we're actually moving up or
                 // there's no ground directly below us
             }
 
             // Dedicated ground check - check slightly below feet
             // This prevents grounded flickering when standing still
-            let ground_check_pos = transform.translation - Vec3::new(0.0, 0.01, 0.0);
-            if check_collision(ground_check_pos) {
-                controller.grounded = true;
-                controller.time_since_grounded = 0.0;
-            } else if velocity.y >= 0.0 {
-                // Only become ungrounded if not falling into ground
-                controller.grounded = false;
+            if !controller.in_water {
+                let ground_check_pos = transform.translation - Vec3::new(0.0, 0.01, 0.0);
+                if check_collision(ground_check_pos) {
+                    controller.grounded = true;
+                    controller.time_since_grounded = 0.0;
+                } else if velocity.y >= 0.0 {
+                    // Only become ungrounded if not falling into ground
+                    controller.grounded = false;
+                }
             }
         }
     }
+}
+
+/// Raycast result containing the hit block and the adjacent block (for placement)
+pub struct RaycastHit {
+    /// The block that was hit
+    pub hit: (i32, i32, i32),
+    /// The adjacent block (where a new block would be placed)
+    pub adjacent: (i32, i32, i32),
 }
 
 /// Raycast through the world to find which block the player is looking at
@@ -997,78 +1136,132 @@ fn raycast_block(
     direction: Vec3,
     max_distance: f32,
     chunk_map: &ChunkMap,
-) -> Option<(i32, i32, i32)> {
+) -> Option<RaycastHit> {
     // DDA-style raycast through voxel grid
     let step = 0.1;
     let mut t = 0.0;
-    
+    let mut prev_pos: Option<(i32, i32, i32)> = None;
+
     while t < max_distance {
         let pos = origin + direction * t;
         let bx = pos.x.floor() as i32;
         let by = pos.y.floor() as i32;
         let bz = pos.z.floor() as i32;
-        
+
+        let current = (bx, by, bz);
+
         if let Some(block) = chunk_map.get_block(bx, by, bz) {
             if block != Block::Air && block != Block::Water {
-                return Some((bx, by, bz));
+                // Use previous position as adjacent, or current if no previous
+                let adjacent = prev_pos.unwrap_or(current);
+                return Some(RaycastHit {
+                    hit: current,
+                    adjacent,
+                });
             }
         }
-        
+
+        // Only update prev_pos if we moved to a new block
+        if prev_pos.map_or(true, |p| p != current) {
+            prev_pos = Some(current);
+        }
+
         t += step;
     }
-    
+
     None
 }
 
-/// System to handle block breaking with left click
-fn block_breaking(
+/// System to handle block breaking with left click and block placement with right click
+fn block_interaction(
     mouse: Res<ButtonInput<MouseButton>>,
     cursor_options: Single<&CursorOptions>,
     player_query: Query<&Transform, With<FpsController>>,
     mut chunk_map: ResMut<ChunkMap>,
     mut chunks_to_remesh: ResMut<ChunksToRemesh>,
 ) {
-    // Only break blocks when cursor is captured
+    // Only interact with blocks when cursor is captured
     if cursor_options.grab_mode != CursorGrabMode::Locked {
         return;
     }
-    
-    if !mouse.just_pressed(MouseButton::Left) {
+
+    let left_click = mouse.just_pressed(MouseButton::Left);
+    let right_click = mouse.just_pressed(MouseButton::Right);
+
+    if !left_click && !right_click {
         return;
     }
-    
+
     let Ok(transform) = player_query.single() else {
         return;
     };
-    
+
     let origin = transform.translation;
     let direction = transform.forward().as_vec3();
-    
-    if let Some((bx, by, bz)) = raycast_block(origin, direction, 5.0, &chunk_map) {
-        // Set the block to air
-        if chunk_map.set_block(bx, by, bz, Block::Air) {
+
+    if let Some(hit) = raycast_block(origin, direction, 5.0, &chunk_map) {
+        let (bx, by, bz) = if left_click {
+            // Break the block we're looking at
+            hit.hit
+        } else {
+            // Place a block adjacent to the one we're looking at
+            hit.adjacent
+        };
+
+        let new_block = if left_click { Block::Air } else { Block::Stone };
+
+        // Don't place blocks inside the player
+        if right_click {
+            // Check if the placement position overlaps with player AABB
+            let player_min = origin - Vec3::new(0.3, 1.6, 0.3);
+            let player_max = origin + Vec3::new(0.3, 0.2, 0.3);
+
+            let block_min = Vec3::new(bx as f32, by as f32, bz as f32);
+            let block_max = block_min + Vec3::ONE;
+
+            // AABB overlap check
+            if player_min.x < block_max.x
+                && player_max.x > block_min.x
+                && player_min.y < block_max.y
+                && player_max.y > block_min.y
+                && player_min.z < block_max.z
+                && player_max.z > block_min.z
+            {
+                return; // Would place inside player, abort
+            }
+        }
+
+        if chunk_map.set_block(bx, by, bz, new_block) {
             // Mark the chunk for remeshing
             let chunk_pos = ChunkPos::new(
                 bx.div_euclid(CHUNK_WIDTH as i32),
                 bz.div_euclid(CHUNK_DEPTH as i32),
             );
             chunks_to_remesh.0.insert(chunk_pos);
-            
+
             // Also mark adjacent chunks if the block is on a boundary
             let local_x = bx.rem_euclid(CHUNK_WIDTH as i32) as usize;
             let local_z = bz.rem_euclid(CHUNK_DEPTH as i32) as usize;
-            
+
             if local_x == 0 {
-                chunks_to_remesh.0.insert(ChunkPos::new(chunk_pos.x - 1, chunk_pos.z));
+                chunks_to_remesh
+                    .0
+                    .insert(ChunkPos::new(chunk_pos.x - 1, chunk_pos.z));
             }
             if local_x == CHUNK_WIDTH - 1 {
-                chunks_to_remesh.0.insert(ChunkPos::new(chunk_pos.x + 1, chunk_pos.z));
+                chunks_to_remesh
+                    .0
+                    .insert(ChunkPos::new(chunk_pos.x + 1, chunk_pos.z));
             }
             if local_z == 0 {
-                chunks_to_remesh.0.insert(ChunkPos::new(chunk_pos.x, chunk_pos.z - 1));
+                chunks_to_remesh
+                    .0
+                    .insert(ChunkPos::new(chunk_pos.x, chunk_pos.z - 1));
             }
             if local_z == CHUNK_DEPTH - 1 {
-                chunks_to_remesh.0.insert(ChunkPos::new(chunk_pos.x, chunk_pos.z + 1));
+                chunks_to_remesh
+                    .0
+                    .insert(ChunkPos::new(chunk_pos.x, chunk_pos.z + 1));
             }
         }
     }
@@ -1079,6 +1272,7 @@ fn remesh_chunks(
     mut chunks_to_remesh: ResMut<ChunksToRemesh>,
     chunk_map: Res<ChunkMap>,
     mut chunks: Query<(&ChunkEntity, &mut ChunkLodMeshes, &mut Mesh3d)>,
+    mut water_chunks: Query<(&WaterEntity, &mut Mesh3d), Without<ChunkEntity>>,
     mut meshes: ResMut<Assets<Mesh>>,
     texture_map: Res<BlockTextureMap>,
     layouts: Res<Assets<TextureAtlasLayout>>,
@@ -1086,14 +1280,14 @@ fn remesh_chunks(
     if chunks_to_remesh.0.is_empty() {
         return;
     }
-    
+
     let Some(layout) = layouts.get(&texture_map.layout) else {
         return;
     };
-    
+
     let atlas_size = layout.size.as_vec2();
     let texture_data = &texture_map.map;
-    
+
     // Process chunks that need remeshing
     for chunk_pos in chunks_to_remesh.0.drain() {
         // Get the chunk data from cache
@@ -1101,7 +1295,7 @@ fn remesh_chunks(
         let Some(chunk) = cache.get(&chunk_pos) else {
             continue;
         };
-        
+
         // Generate new mesh
         let get_uv = |block: &Block, face: &Face| {
             texture_data.get(&(*block, *face)).and_then(|&index| {
@@ -1112,20 +1306,29 @@ fn remesh_chunks(
                 })
             })
         };
-        
-        let mesh_data = generate_chunk_mesh_data(chunk, &get_uv);
-        let new_mesh = meshes.add(mesh_data.into_mesh());
-        
-        // Update the chunk entity's mesh
+
+        let chunk_meshes = generate_chunk_mesh_data(chunk, &get_uv);
+        let new_solid_mesh = meshes.add(chunk_meshes.solid.into_mesh());
+        let new_water_mesh = meshes.add(chunk_meshes.water.into_mesh());
+
+        // Update the solid chunk entity's mesh
         for (chunk_entity, mut lod_meshes, mut mesh) in &mut chunks {
             if chunk_entity.0 == chunk_pos {
                 // Update LOD0 mesh (the detailed one)
-                lod_meshes.lod0 = new_mesh.clone();
-                
+                lod_meshes.lod0 = new_solid_mesh.clone();
+
                 // If currently showing LOD0, update the visible mesh
                 if lod_meshes.current_lod == 0 {
-                    mesh.0 = new_mesh.clone();
+                    mesh.0 = new_solid_mesh.clone();
                 }
+                break;
+            }
+        }
+
+        // Update water mesh
+        for (water_entity, mut mesh) in &mut water_chunks {
+            if water_entity.0 == chunk_pos {
+                mesh.0 = new_water_mesh.clone();
                 break;
             }
         }
@@ -1150,7 +1353,15 @@ fn main() {
         .add_systems(OnEnter(AppState::InGame), setup)
         .add_systems(
             Update,
-            (handle_chunk_tasks, update_chunks, update_chunk_lods, controller_input, block_breaking, remesh_chunks)
+            (
+                handle_chunk_tasks,
+                update_chunks,
+                update_chunk_lods,
+                controller_input,
+                update_underwater_fog,
+                block_interaction,
+                remesh_chunks,
+            )
                 .run_if(in_state(AppState::InGame)),
         )
         .run();
@@ -1216,6 +1427,20 @@ fn check_textures(
                 ..default()
             });
             commands.insert_resource(SharedChunkMaterial(shared_material));
+
+            // Create translucent water material
+            let water_material = materials.add(StandardMaterial {
+                base_color: Color::srgba(0.2, 0.5, 0.95, 0.6), // Translucent blue
+                base_color_texture: Some(image_handle.clone()),
+                alpha_mode: AlphaMode::Blend,
+                perceptual_roughness: 0.3,
+                reflectance: 0.5,
+                unlit: false,
+                double_sided: true,
+                cull_mode: None,
+                ..default()
+            });
+            commands.insert_resource(WaterMaterial(water_material));
 
             let mut map = HashMap::new();
 
