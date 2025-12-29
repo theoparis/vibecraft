@@ -57,8 +57,7 @@ impl ChunkMeshData {
 }
 
 // Grass tint color (Minecraft plains biome green, sRGB values)
-// The grass_block_top.png is grayscale and gets multiplied by this color
-const GRASS_TINT: [f32; 4] = [0.569, 0.741, 0.349, 1.0]; // #91BD59 in hex
+const GRASS_TINT: [f32; 4] = [0.569, 0.741, 0.349, 1.0];
 const NO_TINT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// Water surface height offset (Minecraft water is 14/16 = 0.875 of a block)
@@ -70,30 +69,37 @@ pub struct ChunkMeshes {
     pub water: ChunkMeshData,
 }
 
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+pub enum Face {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Back,
+    Forward,
+}
+
 pub fn generate_chunk_mesh_data(
     chunk: &Chunk,
     get_uv_rect: impl Fn(&Block, &Face) -> Option<Rect>,
 ) -> ChunkMeshes {
-    // Pre-allocate with reasonable capacity (average chunk has ~10k visible faces)
     let mut positions = Vec::with_capacity(40000);
     let mut normals = Vec::with_capacity(40000);
     let mut uvs = Vec::with_capacity(40000);
     let mut colors = Vec::with_capacity(40000);
     let mut indices = Vec::with_capacity(60000);
 
-    // Separate water mesh data
     let mut water_positions = Vec::with_capacity(8000);
     let mut water_normals = Vec::with_capacity(8000);
     let mut water_uvs = Vec::with_capacity(8000);
     let mut water_colors = Vec::with_capacity(8000);
     let mut water_indices = Vec::with_capacity(12000);
 
-    // First pass: find min/max Y for each column to avoid iterating all 256 levels
-    let mut y_ranges = [[0u8; CHUNK_DEPTH]; CHUNK_WIDTH]; // max Y per column (0 = empty)
+    // Find max Y for each column to avoid iterating all 256 levels
+    let mut y_ranges = [[0u8; CHUNK_DEPTH]; CHUNK_WIDTH];
 
     for x in 0..CHUNK_WIDTH {
         for z in 0..CHUNK_DEPTH {
-            // Scan from top down to find highest non-air block
             for y in (0..CHUNK_HEIGHT).rev() {
                 if chunk.get_block(x, y, z) != Block::Air {
                     y_ranges[x][z] = (y + 1).min(255) as u8;
@@ -107,7 +113,7 @@ pub fn generate_chunk_mesh_data(
         for z in 0..CHUNK_DEPTH {
             let max_y = y_ranges[x][z] as usize;
             if max_y == 0 {
-                continue; // Empty column
+                continue;
             }
 
             for y in 0..max_y {
@@ -121,67 +127,54 @@ pub fn generate_chunk_mesh_data(
                 let fz = z as f32;
 
                 if block == Block::Water {
-                    // Generate water mesh separately
-                    // Only render water faces adjacent to air (not other water or solid blocks)
-                    // At chunk boundaries, don't render faces - they'll be handled by adjacent chunks
-                    let neighbor_right = if x == CHUNK_WIDTH - 1 {
-                        None
-                    } else {
-                        Some(chunk.get_block(x + 1, y, z))
-                    };
-                    let neighbor_left = if x == 0 {
-                        None
-                    } else {
-                        Some(chunk.get_block(x - 1, y, z))
-                    };
-                    let neighbor_top = if y == CHUNK_HEIGHT - 1 {
-                        Some(Block::Air)
-                    } else {
-                        Some(chunk.get_block(x, y + 1, z))
-                    };
-                    let neighbor_bottom = if y == 0 {
-                        None
-                    } else {
-                        Some(chunk.get_block(x, y - 1, z))
-                    };
-                    let neighbor_back = if z == CHUNK_DEPTH - 1 {
-                        None
-                    } else {
-                        Some(chunk.get_block(x, y, z + 1))
-                    };
-                    let neighbor_forward = if z == 0 {
-                        None
-                    } else {
-                        Some(chunk.get_block(x, y, z - 1))
-                    };
-
+                    // Water - only render faces adjacent to air (not at chunk boundaries)
                     let faces = [
-                        (Face::Right, neighbor_right == Some(Block::Air)),
-                        (Face::Left, neighbor_left == Some(Block::Air)),
-                        (Face::Top, neighbor_top == Some(Block::Air)),
-                        (Face::Bottom, neighbor_bottom == Some(Block::Air)),
-                        (Face::Back, neighbor_back == Some(Block::Air)),
-                        (Face::Forward, neighbor_forward == Some(Block::Air)),
+                        (
+                            Face::Right,
+                            x < CHUNK_WIDTH - 1 && chunk.get_block(x + 1, y, z) == Block::Air,
+                        ),
+                        (
+                            Face::Left,
+                            x > 0 && chunk.get_block(x - 1, y, z) == Block::Air,
+                        ),
+                        (
+                            Face::Top,
+                            y >= CHUNK_HEIGHT - 1 || chunk.get_block(x, y + 1, z) == Block::Air,
+                        ),
+                        (
+                            Face::Bottom,
+                            y > 0 && chunk.get_block(x, y - 1, z) == Block::Air,
+                        ),
+                        (
+                            Face::Back,
+                            z < CHUNK_DEPTH - 1 && chunk.get_block(x, y, z + 1) == Block::Air,
+                        ),
+                        (
+                            Face::Forward,
+                            z > 0 && chunk.get_block(x, y, z - 1) == Block::Air,
+                        ),
                     ];
 
                     for (face, visible) in faces {
-                        if visible && let Some(rect) = get_uv_rect(&block, &face) {
-                            add_water_face(
-                                &mut water_positions,
-                                &mut water_normals,
-                                &mut water_uvs,
-                                &mut water_colors,
-                                &mut water_indices,
-                                fx,
-                                fy,
-                                fz,
-                                face,
-                                rect,
-                            );
+                        if visible {
+                            if let Some(rect) = get_uv_rect(&block, &face) {
+                                add_water_face(
+                                    &mut water_positions,
+                                    &mut water_normals,
+                                    &mut water_uvs,
+                                    &mut water_colors,
+                                    &mut water_indices,
+                                    fx,
+                                    fy,
+                                    fz,
+                                    face,
+                                    rect,
+                                );
+                            }
                         }
                     }
                 } else {
-                    // Solid block
+                    // Solid blocks - render faces adjacent to transparent blocks
                     let faces = [
                         (
                             Face::Right,
@@ -210,26 +203,28 @@ pub fn generate_chunk_mesh_data(
                     ];
 
                     for (face, visible) in faces {
-                        if visible && let Some(rect) = get_uv_rect(&block, &face) {
-                            let tint = if block == Block::Grass && face == Face::Top {
-                                GRASS_TINT
-                            } else {
-                                NO_TINT
-                            };
+                        if visible {
+                            if let Some(rect) = get_uv_rect(&block, &face) {
+                                let tint = if block == Block::Grass && face == Face::Top {
+                                    GRASS_TINT
+                                } else {
+                                    NO_TINT
+                                };
 
-                            add_face(
-                                &mut positions,
-                                &mut normals,
-                                &mut uvs,
-                                &mut colors,
-                                &mut indices,
-                                fx,
-                                fy,
-                                fz,
-                                face,
-                                rect,
-                                tint,
-                            );
+                                add_face(
+                                    &mut positions,
+                                    &mut normals,
+                                    &mut uvs,
+                                    &mut colors,
+                                    &mut indices,
+                                    fx,
+                                    fy,
+                                    fz,
+                                    face,
+                                    rect,
+                                    tint,
+                                );
+                            }
                         }
                     }
                 }
@@ -255,8 +250,253 @@ pub fn generate_chunk_mesh_data(
     }
 }
 
+fn add_face(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    x: f32,
+    y: f32,
+    z: f32,
+    face: Face,
+    rect: Rect,
+    tint: [f32; 4],
+) {
+    let start_idx = positions.len() as u32;
+
+    let (u_min, v_min) = (rect.min.x, rect.min.y);
+    let (u_max, v_max) = (rect.max.x, rect.max.y);
+
+    match face {
+        Face::Top => {
+            positions.extend_from_slice(&[
+                [x, y + 1.0, z],
+                [x, y + 1.0, z + 1.0],
+                [x + 1.0, y + 1.0, z + 1.0],
+                [x + 1.0, y + 1.0, z],
+            ]);
+            normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_min],
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+            ]);
+        }
+        Face::Bottom => {
+            positions.extend_from_slice(&[
+                [x, y, z],
+                [x + 1.0, y, z],
+                [x + 1.0, y, z + 1.0],
+                [x, y, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[0.0, -1.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_min],
+                [u_max, v_min],
+                [u_max, v_max],
+                [u_min, v_max],
+            ]);
+        }
+        Face::Right => {
+            positions.extend_from_slice(&[
+                [x + 1.0, y, z + 1.0],
+                [x + 1.0, y, z],
+                [x + 1.0, y + 1.0, z],
+                [x + 1.0, y + 1.0, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[1.0, 0.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Left => {
+            positions.extend_from_slice(&[
+                [x, y, z],
+                [x, y, z + 1.0],
+                [x, y + 1.0, z + 1.0],
+                [x, y + 1.0, z],
+            ]);
+            normals.extend_from_slice(&[[-1.0, 0.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Back => {
+            positions.extend_from_slice(&[
+                [x, y, z + 1.0],
+                [x + 1.0, y, z + 1.0],
+                [x + 1.0, y + 1.0, z + 1.0],
+                [x, y + 1.0, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Forward => {
+            positions.extend_from_slice(&[
+                [x + 1.0, y, z],
+                [x, y, z],
+                [x, y + 1.0, z],
+                [x + 1.0, y + 1.0, z],
+            ]);
+            normals.extend_from_slice(&[[0.0, 0.0, -1.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+    }
+
+    colors.extend_from_slice(&[tint; 4]);
+
+    indices.extend_from_slice(&[
+        start_idx,
+        start_idx + 1,
+        start_idx + 2,
+        start_idx,
+        start_idx + 2,
+        start_idx + 3,
+    ]);
+}
+
+fn add_water_face(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    x: f32,
+    y: f32,
+    z: f32,
+    face: Face,
+    rect: Rect,
+) {
+    let start_idx = positions.len() as u32;
+
+    let (u_min, v_min) = (rect.min.x, rect.min.y);
+    let (u_max, v_max) = (rect.max.x, rect.max.y);
+    let water_top = y + WATER_HEIGHT;
+
+    match face {
+        Face::Top => {
+            positions.extend_from_slice(&[
+                [x, water_top, z],
+                [x, water_top, z + 1.0],
+                [x + 1.0, water_top, z + 1.0],
+                [x + 1.0, water_top, z],
+            ]);
+            normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_min],
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+            ]);
+        }
+        Face::Bottom => {
+            positions.extend_from_slice(&[
+                [x, y, z],
+                [x + 1.0, y, z],
+                [x + 1.0, y, z + 1.0],
+                [x, y, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[0.0, -1.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_min],
+                [u_max, v_min],
+                [u_max, v_max],
+                [u_min, v_max],
+            ]);
+        }
+        Face::Right => {
+            positions.extend_from_slice(&[
+                [x + 1.0, y, z + 1.0],
+                [x + 1.0, y, z],
+                [x + 1.0, water_top, z],
+                [x + 1.0, water_top, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[1.0, 0.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Left => {
+            positions.extend_from_slice(&[
+                [x, y, z],
+                [x, y, z + 1.0],
+                [x, water_top, z + 1.0],
+                [x, water_top, z],
+            ]);
+            normals.extend_from_slice(&[[-1.0, 0.0, 0.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Back => {
+            positions.extend_from_slice(&[
+                [x, y, z + 1.0],
+                [x + 1.0, y, z + 1.0],
+                [x + 1.0, water_top, z + 1.0],
+                [x, water_top, z + 1.0],
+            ]);
+            normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+        Face::Forward => {
+            positions.extend_from_slice(&[
+                [x + 1.0, y, z],
+                [x, y, z],
+                [x, water_top, z],
+                [x + 1.0, water_top, z],
+            ]);
+            normals.extend_from_slice(&[[0.0, 0.0, -1.0]; 4]);
+            uvs.extend_from_slice(&[
+                [u_min, v_max],
+                [u_max, v_max],
+                [u_max, v_min],
+                [u_min, v_min],
+            ]);
+        }
+    }
+
+    colors.extend_from_slice(&[NO_TINT; 4]);
+
+    indices.extend_from_slice(&[
+        start_idx,
+        start_idx + 1,
+        start_idx + 2,
+        start_idx,
+        start_idx + 2,
+        start_idx + 3,
+    ]);
+}
+
 /// Generate a lower-detail mesh by sampling blocks at intervals
-/// Note: For LOD, we only generate solid blocks - water is skipped at distance
 pub fn generate_chunk_mesh_data_lod(
     chunk: &Chunk,
     lod: LodLevel,
@@ -264,12 +504,10 @@ pub fn generate_chunk_mesh_data_lod(
 ) -> ChunkMeshData {
     let block_size = lod.block_size();
 
-    // For full detail, use the regular function and extract solid mesh
     if block_size == 1 {
         return generate_chunk_mesh_data(chunk, get_uv_rect).solid;
     }
 
-    // Pre-allocate with smaller capacity for LOD (fewer faces)
     let mut positions = Vec::with_capacity(10000);
     let mut normals = Vec::with_capacity(10000);
     let mut uvs = Vec::with_capacity(10000);
@@ -279,7 +517,6 @@ pub fn generate_chunk_mesh_data_lod(
     let step = block_size;
     let fsize = block_size as f32;
 
-    // Find max Y to limit iteration
     let mut max_y = 0usize;
     for x in 0..CHUNK_WIDTH {
         for z in 0..CHUNK_DEPTH {
@@ -291,16 +528,12 @@ pub fn generate_chunk_mesh_data_lod(
             }
         }
     }
-    // Round up to next step boundary
     let max_y = ((max_y + step - 1) / step) * step;
 
-    // Iterate over block groups
     for x in (0..CHUNK_WIDTH).step_by(step) {
         for y in (0..max_y).step_by(step) {
             for z in (0..CHUNK_DEPTH).step_by(step) {
-                // Find the dominant non-air block in this group
                 let block = get_dominant_block(chunk, x, y, z, block_size);
-                // Skip air and water for LOD (water is only rendered at full detail)
                 if block == Block::Air || block == Block::Water {
                     continue;
                 }
@@ -309,7 +542,6 @@ pub fn generate_chunk_mesh_data_lod(
                 let fy = y as f32;
                 let fz = z as f32;
 
-                // Check neighbors for face visibility (at LOD scale)
                 let faces = [
                     (
                         Face::Right,
@@ -362,27 +594,29 @@ pub fn generate_chunk_mesh_data_lod(
                 ];
 
                 for (face, visible) in faces {
-                    if visible && let Some(rect) = get_uv_rect(&block, &face) {
-                        let tint = if block == Block::Grass && face == Face::Top {
-                            GRASS_TINT
-                        } else {
-                            NO_TINT
-                        };
+                    if visible {
+                        if let Some(rect) = get_uv_rect(&block, &face) {
+                            let tint = if block == Block::Grass && face == Face::Top {
+                                GRASS_TINT
+                            } else {
+                                NO_TINT
+                            };
 
-                        add_face_scaled(
-                            &mut positions,
-                            &mut normals,
-                            &mut uvs,
-                            &mut colors,
-                            &mut indices,
-                            fx,
-                            fy,
-                            fz,
-                            fsize,
-                            face,
-                            rect,
-                            tint,
-                        );
+                            add_face_scaled(
+                                &mut positions,
+                                &mut normals,
+                                &mut uvs,
+                                &mut colors,
+                                &mut indices,
+                                fx,
+                                fy,
+                                fz,
+                                fsize,
+                                face,
+                                rect,
+                                tint,
+                            );
+                        }
                     }
                 }
             }
@@ -398,80 +632,6 @@ pub fn generate_chunk_mesh_data_lod(
     }
 }
 
-/// Get the dominant (most common non-air) block in a group
-fn get_dominant_block(
-    chunk: &Chunk,
-    start_x: usize,
-    start_y: usize,
-    start_z: usize,
-    size: usize,
-) -> Block {
-    let mut counts = [0u32; 6]; // Air, Stone, Dirt, Grass, Water, Sand
-
-    let end_x = (start_x + size).min(CHUNK_WIDTH);
-    let end_y = (start_y + size).min(CHUNK_HEIGHT);
-    let end_z = (start_z + size).min(CHUNK_DEPTH);
-
-    for x in start_x..end_x {
-        for y in start_y..end_y {
-            for z in start_z..end_z {
-                let block = chunk.get_block(x, y, z);
-                counts[block as usize] += 1;
-            }
-        }
-    }
-
-    // Find most common non-air block
-    let mut best_block = Block::Air;
-    let mut best_count = 0;
-
-    for (i, &count) in counts.iter().enumerate().skip(1) {
-        if count > best_count {
-            best_count = count;
-            best_block = Block::from(i as u8);
-        }
-    }
-
-    // Only return a block if it fills at least 25% of the group
-    let total = (end_x - start_x) * (end_y - start_y) * (end_z - start_z);
-    if best_count as usize * 4 >= total {
-        best_block
-    } else {
-        Block::Air
-    }
-}
-
-/// Check if a block group is mostly transparent (air or water)
-fn is_group_transparent(
-    chunk: &Chunk,
-    start_x: usize,
-    start_y: usize,
-    start_z: usize,
-    size: usize,
-) -> bool {
-    let end_x = (start_x + size).min(CHUNK_WIDTH);
-    let end_y = (start_y + size).min(CHUNK_HEIGHT);
-    let end_z = (start_z + size).min(CHUNK_DEPTH);
-
-    let mut transparent_count = 0;
-    let mut total = 0;
-
-    for x in start_x..end_x {
-        for y in start_y..end_y {
-            for z in start_z..end_z {
-                if chunk.get_block(x, y, z).is_transparent() {
-                    transparent_count += 1;
-                }
-                total += 1;
-            }
-        }
-    }
-
-    // Consider transparent if more than 50% transparent
-    transparent_count * 2 > total
-}
-
-/// Add a scaled face for LOD meshes
 fn add_face_scaled(
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
@@ -596,276 +756,70 @@ fn add_face_scaled(
     ]);
 }
 
-#[derive(Clone, Copy, Hash, Eq, PartialEq)]
-pub enum Face {
-    Top,
-    Bottom,
-    Left,
-    Right,
-    Back,
-    Forward,
-}
+fn get_dominant_block(
+    chunk: &Chunk,
+    start_x: usize,
+    start_y: usize,
+    start_z: usize,
+    size: usize,
+) -> Block {
+    let mut counts = [0u32; 6];
 
-fn add_face(
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    uvs: &mut Vec<[f32; 2]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
-    x: f32,
-    y: f32,
-    z: f32,
-    face: Face,
-    rect: Rect,
-    tint: [f32; 4],
-) {
-    let start_idx = positions.len() as u32;
+    let end_x = (start_x + size).min(CHUNK_WIDTH);
+    let end_y = (start_y + size).min(CHUNK_HEIGHT);
+    let end_z = (start_z + size).min(CHUNK_DEPTH);
 
-    let (u_min, v_min) = (rect.min.x, rect.min.y);
-    let (u_max, v_max) = (rect.max.x, rect.max.y);
-
-    match face {
-        // Top face: looking down at the XZ plane
-        // Vertices ordered CCW when viewed from above (+Y)
-        Face::Top => {
-            positions.extend_from_slice(&[
-                [x, y + 1.0, z],             // 0: corner at (0,0) in XZ
-                [x, y + 1.0, z + 1.0],       // 1: corner at (0,1) in XZ
-                [x + 1.0, y + 1.0, z + 1.0], // 2: corner at (1,1) in XZ
-                [x + 1.0, y + 1.0, z],       // 3: corner at (1,0) in XZ
-            ]);
-            normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
-            // Map X to U, Z to V
-            uvs.extend_from_slice(&[
-                [u_min, v_min], // 0: X=0, Z=0
-                [u_min, v_max], // 1: X=0, Z=1
-                [u_max, v_max], // 2: X=1, Z=1
-                [u_max, v_min], // 3: X=1, Z=0
-            ]);
-        }
-        // Bottom face: looking up at the XZ plane
-        Face::Bottom => {
-            positions.extend_from_slice(&[
-                [x, y, z],             // 0
-                [x + 1.0, y, z],       // 1
-                [x + 1.0, y, z + 1.0], // 2
-                [x, y, z + 1.0],       // 3
-            ]);
-            normals.extend_from_slice(&[[0.0, -1.0, 0.0]; 4]);
-            // Map X to U, Z to V (mirrored for bottom)
-            uvs.extend_from_slice(&[
-                [u_min, v_min], // 0
-                [u_max, v_min], // 1
-                [u_max, v_max], // 2
-                [u_min, v_max], // 3
-            ]);
-        }
-        // Right face (+X): looking at it from +X direction
-        // Horizontal axis is Z (left=+Z, right=-Z when looking at face)
-        // Vertical axis is Y (bottom=y, top=y+1)
-        Face::Right => {
-            positions.extend_from_slice(&[
-                [x + 1.0, y, z + 1.0],       // 0: bottom-left (high Z, low Y)
-                [x + 1.0, y, z],             // 1: bottom-right (low Z, low Y)
-                [x + 1.0, y + 1.0, z],       // 2: top-right (low Z, high Y)
-                [x + 1.0, y + 1.0, z + 1.0], // 3: top-left (high Z, high Y)
-            ]);
-            normals.extend_from_slice(&[[1.0, 0.0, 0.0]; 4]);
-            // For side faces: U maps horizontally, V maps vertically
-            // v_max = bottom of texture, v_min = top of texture
-            uvs.extend_from_slice(&[
-                [u_min, v_max], // 0: left, bottom
-                [u_max, v_max], // 1: right, bottom
-                [u_max, v_min], // 2: right, top
-                [u_min, v_min], // 3: left, top
-            ]);
-        }
-        // Left face (-X): looking at it from -X direction
-        Face::Left => {
-            positions.extend_from_slice(&[
-                [x, y, z],             // 0: bottom-left (low Z, low Y)
-                [x, y, z + 1.0],       // 1: bottom-right (high Z, low Y)
-                [x, y + 1.0, z + 1.0], // 2: top-right (high Z, high Y)
-                [x, y + 1.0, z],       // 3: top-left (low Z, high Y)
-            ]);
-            normals.extend_from_slice(&[[-1.0, 0.0, 0.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max], // 0: left, bottom
-                [u_max, v_max], // 1: right, bottom
-                [u_max, v_min], // 2: right, top
-                [u_min, v_min], // 3: left, top
-            ]);
-        }
-        // Back face (+Z): looking at it from +Z direction
-        Face::Back => {
-            positions.extend_from_slice(&[
-                [x, y, z + 1.0],             // 0: bottom-left (low X, low Y)
-                [x + 1.0, y, z + 1.0],       // 1: bottom-right (high X, low Y)
-                [x + 1.0, y + 1.0, z + 1.0], // 2: top-right (high X, high Y)
-                [x, y + 1.0, z + 1.0],       // 3: top-left (low X, high Y)
-            ]);
-            normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max], // 0: left, bottom
-                [u_max, v_max], // 1: right, bottom
-                [u_max, v_min], // 2: right, top
-                [u_min, v_min], // 3: left, top
-            ]);
-        }
-        // Forward face (-Z): looking at it from -Z direction
-        Face::Forward => {
-            positions.extend_from_slice(&[
-                [x + 1.0, y, z],       // 0: bottom-left (high X, low Y)
-                [x, y, z],             // 1: bottom-right (low X, low Y)
-                [x, y + 1.0, z],       // 2: top-right (low X, high Y)
-                [x + 1.0, y + 1.0, z], // 3: top-left (high X, high Y)
-            ]);
-            normals.extend_from_slice(&[[0.0, 0.0, -1.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max], // 0: left, bottom
-                [u_max, v_max], // 1: right, bottom
-                [u_max, v_min], // 2: right, top
-                [u_min, v_min], // 3: left, top
-            ]);
+    for x in start_x..end_x {
+        for y in start_y..end_y {
+            for z in start_z..end_z {
+                let block = chunk.get_block(x, y, z);
+                counts[block as usize] += 1;
+            }
         }
     }
 
-    // Add vertex colors (4 vertices per face)
-    colors.extend_from_slice(&[tint; 4]);
+    let mut best_block = Block::Air;
+    let mut best_count = 0;
 
-    indices.extend_from_slice(&[
-        start_idx,
-        start_idx + 1,
-        start_idx + 2,
-        start_idx,
-        start_idx + 2,
-        start_idx + 3,
-    ]);
-}
-
-/// Add a water face with lowered top surface (like Minecraft)
-fn add_water_face(
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    uvs: &mut Vec<[f32; 2]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
-    x: f32,
-    y: f32,
-    z: f32,
-    face: Face,
-    rect: Rect,
-) {
-    let start_idx = positions.len() as u32;
-
-    let (u_min, v_min) = (rect.min.x, rect.min.y);
-    let (u_max, v_max) = (rect.max.x, rect.max.y);
-
-    // Water top is slightly lower than a full block
-    let water_top = y + WATER_HEIGHT;
-
-    match face {
-        Face::Top => {
-            positions.extend_from_slice(&[
-                [x, water_top, z],
-                [x, water_top, z + 1.0],
-                [x + 1.0, water_top, z + 1.0],
-                [x + 1.0, water_top, z],
-            ]);
-            normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_min],
-                [u_min, v_max],
-                [u_max, v_max],
-                [u_max, v_min],
-            ]);
-        }
-        Face::Bottom => {
-            positions.extend_from_slice(&[
-                [x, y, z],
-                [x + 1.0, y, z],
-                [x + 1.0, y, z + 1.0],
-                [x, y, z + 1.0],
-            ]);
-            normals.extend_from_slice(&[[0.0, -1.0, 0.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_min],
-                [u_max, v_min],
-                [u_max, v_max],
-                [u_min, v_max],
-            ]);
-        }
-        Face::Right => {
-            positions.extend_from_slice(&[
-                [x + 1.0, y, z + 1.0],
-                [x + 1.0, y, z],
-                [x + 1.0, water_top, z],
-                [x + 1.0, water_top, z + 1.0],
-            ]);
-            normals.extend_from_slice(&[[1.0, 0.0, 0.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max],
-                [u_max, v_max],
-                [u_max, v_min],
-                [u_min, v_min],
-            ]);
-        }
-        Face::Left => {
-            positions.extend_from_slice(&[
-                [x, y, z],
-                [x, y, z + 1.0],
-                [x, water_top, z + 1.0],
-                [x, water_top, z],
-            ]);
-            normals.extend_from_slice(&[[-1.0, 0.0, 0.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max],
-                [u_max, v_max],
-                [u_max, v_min],
-                [u_min, v_min],
-            ]);
-        }
-        Face::Back => {
-            positions.extend_from_slice(&[
-                [x, y, z + 1.0],
-                [x + 1.0, y, z + 1.0],
-                [x + 1.0, water_top, z + 1.0],
-                [x, water_top, z + 1.0],
-            ]);
-            normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max],
-                [u_max, v_max],
-                [u_max, v_min],
-                [u_min, v_min],
-            ]);
-        }
-        Face::Forward => {
-            positions.extend_from_slice(&[
-                [x + 1.0, y, z],
-                [x, y, z],
-                [x, water_top, z],
-                [x + 1.0, water_top, z],
-            ]);
-            normals.extend_from_slice(&[[0.0, 0.0, -1.0]; 4]);
-            uvs.extend_from_slice(&[
-                [u_min, v_max],
-                [u_max, v_max],
-                [u_max, v_min],
-                [u_min, v_min],
-            ]);
+    for (i, &count) in counts.iter().enumerate().skip(1) {
+        if count > best_count {
+            best_count = count;
+            best_block = Block::from(i as u8);
         }
     }
 
-    // White color - tinting handled by material
-    colors.extend_from_slice(&[NO_TINT; 4]);
+    let total = (end_x - start_x) * (end_y - start_y) * (end_z - start_z);
+    if best_count as usize * 4 >= total {
+        best_block
+    } else {
+        Block::Air
+    }
+}
 
-    indices.extend_from_slice(&[
-        start_idx,
-        start_idx + 1,
-        start_idx + 2,
-        start_idx,
-        start_idx + 2,
-        start_idx + 3,
-    ]);
+fn is_group_transparent(
+    chunk: &Chunk,
+    start_x: usize,
+    start_y: usize,
+    start_z: usize,
+    size: usize,
+) -> bool {
+    let end_x = (start_x + size).min(CHUNK_WIDTH);
+    let end_y = (start_y + size).min(CHUNK_HEIGHT);
+    let end_z = (start_z + size).min(CHUNK_DEPTH);
+
+    let mut transparent_count = 0;
+    let mut total = 0;
+
+    for x in start_x..end_x {
+        for y in start_y..end_y {
+            for z in start_z..end_z {
+                if chunk.get_block(x, y, z).is_transparent() {
+                    transparent_count += 1;
+                }
+                total += 1;
+            }
+        }
+    }
+
+    transparent_count * 2 > total
 }
